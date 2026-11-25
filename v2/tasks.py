@@ -19,9 +19,96 @@ logger = logging.getLogger(__name__)
 VERSIONED = {"import", "product_showcase", "edit_objects"}
 
 
+
+async def run_worker(sandbox, folder, spec, log, remaining, cancelled):
+    out = folder / "artifacts"
+    blender = [
+        "@blender", "-b", "--factory-startup", "--disable-autoexec", "-t", "2",
+        "--python-exit-code", "1", "--python", "/worker.py",
+    ]
+    source = sandbox.script.read_bytes()
+    if spec.get("recipe_sha256") and hashlib.sha256(source).hexdigest() != spec["recipe_sha256"]:
+        raise WorkerError("RECIPE_CHANGED", "The approved recipe version has changed; resubmit explicitly")
+    if spec["operation"] in VERSIONED:
+        (out / "recipe.py").write_bytes(source)
+    if spec.get("cad"):
+        await sandbox.run(folder, ["@cad-python", "/cad_worker.py"], remaining(), log, cancelled)
+    await sandbox.run(folder, blender, remaining(), log, cancelled)
+    if spec["operation"] == "render_animation":
+        expected = [out / f"seq-{i:06d}.png" for i in range(1, len(spec["frames"]) + 1)]
+        if not all(path.is_file() for path in expected):
+            raise WorkerError("MISSING_FRAMES", "Blender did not output every requested frame")
+        fps = spec["render"]["fps"]
+        await sandbox.run(folder, [
+            "/usr/bin/ffmpeg", "-nostdin", "-loglevel", "error", "-threads", "1",
+            "-framerate", str(fps), "-i", "/output/seq-%06d.png",
+            "-c:v", "libx264", "-threads", "1", "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart", "/output/preview.mp4",
+        ], remaining(), log, cancelled)
+        await sandbox.run(folder, [
+            "/usr/bin/ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+            "stream=codec_name,width,height,nb_frames", "-of", "json", "/output/preview.mp4",
+        ], remaining(), log, cancelled)
+
+
+def collect_outputs(spec, out):
+    required = {
+        "import": ["scene.blend", "model-report.json"],
+        "product_showcase": ["scene.blend", "recipe.py"],
+        "edit_objects": ["scene.blend", "recipe.py"],
+        "inspect": ["model-report.json"],
+        "probe": ["environment.json"] + (["frame-1.png"] if spec.get("render") else []),
+        "render_animation": ["preview.mp4"],
+        "render_image": [f"frame-{n}.png" for n in spec.get("frames", [])],
+        "extract_frames": [f"frame-{n}.png" for n in spec.get("frames", [])],
+        "export": ["project.zip"],
+    }[spec["operation"]]
+    for name in required:
+        path = out / name
+        if path.is_symlink() or not path.is_file() or not path.stat().st_size:
+            raise WorkerError("MISSING_OUTPUT", f"Expected output is missing: {name}")
+        with path.open("rb") as stream:
+            signature = stream.read(12)
+        suffix = path.suffix
+        if (
+            (suffix == ".png" and not signature.startswith(b"\x89PNG\r\n\x1a\n"))
+            or (suffix == ".mp4" and signature[4:8] != b"ftyp")
+            or (suffix == ".blend" and not signature.startswith((b"BLENDER", b"\x28\xb5\x2f\xfd")))
+            or (suffix == ".zip" and not signature.startswith(b"PK"))
+        ):
+            raise WorkerError("INVALID_OUTPUT", f"Unexpected file signature: {name}")
+    outputs = [{
+        "name": p.name, "bytes": p.stat().st_size, "sha256": sha256(p),
+    } for p in sorted(out.iterdir()) if p.is_file() and not p.is_symlink() and p.name != "progress.json"]
+    version = None
+    if spec["operation"] in VERSIONED:
+        version = {
+            "id": uuid4().hex, "parent": spec.get("base"),
+            "hash": sha256(out / "scene.blend"), "blender": json.loads((out / "environment.json").read_text())["blender"],
+        }
+    return outputs, version
+
+
+def finish_job(db, job, status, error_code, error, outputs, version):
+    if version and status == "completed":
+        db.execute("INSERT INTO versions VALUES (?,?,?,?,?,?,?)", (
+            version["id"], job["project"], job["id"], version["parent"],
+            time.time(), version["hash"], version["blender"],
+        ))
+    db.execute(
+        "UPDATE jobs SET status=?,ended=?,error_code=?,error=?,outputs=?,version=? WHERE id=?",
+        (
+            status, time.time(), error_code, error[:4000] if error else None,
+            canonical(outputs) if status == "completed" else None,
+            version["id"] if version and status == "completed" else None, job["id"],
+        ),
+    )
+
+
 class TaskRunner:
-    def __init__(self, store):
+    def __init__(self, store, remote=False):
         self.store = store
+        self.remote = remote
         self.sandbox = Sandbox()
         self.event = asyncio.Event()
         self.dispatcher = None
@@ -40,6 +127,8 @@ class TaskRunner:
                    error='Worker restarted before the task finished'
                    WHERE status='running'""", (time.time(),),
             )
+            if self.remote:
+                db.execute("DELETE FROM worker_leases")
         self.dispatcher = asyncio.create_task(self.dispatch())
 
     async def stop(self):
@@ -59,7 +148,11 @@ class TaskRunner:
         while True:
             self.event.clear()
             with self.store.connection() as db:
-                row = db.execute("SELECT * FROM jobs WHERE status='queued' ORDER BY created LIMIT 1").fetchone()
+                row = db.execute(
+                    "SELECT * FROM jobs WHERE status='queued' AND "
+                    "(?=0 OR json_extract(spec,'$.operation')='export') ORDER BY created LIMIT 1",
+                    (self.remote,),
+                ).fetchone()
                 if row:
                     db.execute("UPDATE jobs SET status='running',started=? WHERE id=?", (time.time(), row["id"]))
             if row:
@@ -126,67 +219,9 @@ class TaskRunner:
                 if spec["operation"] == "export":
                     self.export_project(job, out)
                 else:
-                    blender = [
-                        "@blender", "-b", "--factory-startup", "--disable-autoexec", "-t", "2",
-                        "--python-exit-code", "1", "--python", "/worker.py",
-                    ]
-                    source = self.sandbox.script.read_bytes()
-                    if spec.get("recipe_sha256") and hashlib.sha256(source).hexdigest() != spec["recipe_sha256"]:
-                        raise WorkerError("RECIPE_CHANGED", "The approved recipe version has changed; resubmit explicitly")
-                    if spec["operation"] in VERSIONED:
-                        (out / "recipe.py").write_bytes(source)
-                    if spec.get("cad"):
-                        await self.sandbox.run(folder, ["@cad-python", "/cad_worker.py"], remaining(), log, cancelled)
-                    await self.sandbox.run(folder, blender, remaining(), log, cancelled)
-                    if spec["operation"] == "render_animation":
-                        expected = [out / f"seq-{i:06d}.png" for i in range(1, len(spec["frames"]) + 1)]
-                        if not all(path.is_file() for path in expected):
-                            raise WorkerError("MISSING_FRAMES", "Blender did not output every requested frame")
-                        fps = spec["render"]["fps"]
-                        await self.sandbox.run(folder, [
-                            "/usr/bin/ffmpeg", "-nostdin", "-loglevel", "error", "-threads", "1",
-                            "-framerate", str(fps), "-i", "/output/seq-%06d.png",
-                            "-c:v", "libx264", "-threads", "1", "-pix_fmt", "yuv420p",
-                            "-movflags", "+faststart", "/output/preview.mp4",
-                        ], remaining(), log, cancelled)
-                        await self.sandbox.run(folder, [
-                            "/usr/bin/ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
-                            "stream=codec_name,width,height,nb_frames", "-of", "json", "/output/preview.mp4",
-                        ], remaining(), log, cancelled)
+                    await run_worker(self.sandbox, folder, spec, log, remaining, cancelled)
                 remaining()
-            required = {
-                "import": ["scene.blend", "model-report.json"],
-                "product_showcase": ["scene.blend", "recipe.py"],
-                "edit_objects": ["scene.blend", "recipe.py"],
-                "inspect": ["model-report.json"],
-                "probe": ["environment.json"] + (["frame-1.png"] if spec.get("render") else []),
-                "render_animation": ["preview.mp4"],
-                "render_image": [f"frame-{n}.png" for n in spec.get("frames", [])],
-                "extract_frames": [f"frame-{n}.png" for n in spec.get("frames", [])],
-                "export": ["project.zip"],
-            }[spec["operation"]]
-            for name in required:
-                path = out / name
-                if path.is_symlink() or not path.is_file() or not path.stat().st_size:
-                    raise WorkerError("MISSING_OUTPUT", f"Expected output is missing: {name}")
-                with path.open("rb") as stream:
-                    signature = stream.read(12)
-                suffix = path.suffix
-                if (
-                    (suffix == ".png" and not signature.startswith(b"\x89PNG\r\n\x1a\n"))
-                    or (suffix == ".mp4" and signature[4:8] != b"ftyp")
-                    or (suffix == ".blend" and not signature.startswith((b"BLENDER", b"\x28\xb5\x2f\xfd")))
-                    or (suffix == ".zip" and not signature.startswith(b"PK"))
-                ):
-                    raise WorkerError("INVALID_OUTPUT", f"Unexpected file signature: {name}")
-            outputs = [{
-                "name": p.name, "bytes": p.stat().st_size, "sha256": sha256(p),
-            } for p in sorted(out.iterdir()) if p.is_file() and not p.is_symlink() and p.name != "progress.json"]
-            if spec["operation"] in VERSIONED:
-                version = {
-                    "id": uuid4().hex, "parent": spec.get("base"),
-                    "hash": sha256(out / "scene.blend"), "blender": json.loads((out / "environment.json").read_text())["blender"],
-                }
+            outputs, version = collect_outputs(spec, out)
             status = "completed"
         except WorkerError as exc:
             error_code, error = exc.code, str(exc)
@@ -200,19 +235,7 @@ class TaskRunner:
             logger.exception("Production task failed")
         finally:
             with self.store.connection() as db:
-                if version and status == "completed":
-                    db.execute("INSERT INTO versions VALUES (?,?,?,?,?,?,?)", (
-                        version["id"], job["project"], job["id"], version["parent"],
-                        time.time(), version["hash"], version["blender"],
-                    ))
-                db.execute(
-                    "UPDATE jobs SET status=?,ended=?,error_code=?,error=?,outputs=?,version=? WHERE id=?",
-                    (
-                        status, time.time(), error_code, error[:4000] if error else None,
-                        canonical(outputs) if status == "completed" else None,
-                        version["id"] if version and status == "completed" else None, job["id"],
-                    ),
-                )
+                finish_job(db, job, status, error_code, error, outputs, version)
             shutil.rmtree(folder / "inputs", ignore_errors=True)
 
     def export_project(self, job, out):

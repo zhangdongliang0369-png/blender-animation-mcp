@@ -19,6 +19,7 @@ from starlette.responses import FileResponse, HTMLResponse, JSONResponse
 from starlette.routing import Route
 
 from .models import Edit, Engine, Frame, Name, RenderSettings, Showcase
+from .relay import Relay
 from .store import DEPENDENCIES, MIB, MODELS, Store, project_path
 from .tasks import TaskRunner
 
@@ -77,7 +78,11 @@ class Production:
             raise ValueError("Production signing key must differ from the MCP access credential")
         owner = os.environ.get("BLENDER_V2_PRINCIPAL", "workspace-owner")
         self.store = Store(Path(os.environ["BLENDER_V2_DIR"]), owner, signing_key)
-        self.tasks = TaskRunner(self.store)
+        worker_key = os.environ.get("BLENDER_V2_WORKER_KEY")
+        if worker_key and any(secrets.compare_digest(worker_key, value) for value in (access_id, signing_key)):
+            raise ValueError("Worker credentials must be separate")
+        self.tasks = TaskRunner(self.store, remote=bool(worker_key))
+        self.relay = Relay(self.tasks, worker_key) if worker_key else None
         self.origin = origin
         self.v1_running = v1_running
         self.upload_mib = int(os.environ.get("BLENDER_V2_UPLOAD_MIB", "32"))
@@ -97,6 +102,8 @@ class Production:
                     await self.tasks.stop()
 
         app.router.lifespan_context = lifespan
+        if self.relay:
+            self.relay.mount(app)
         app.routes.append(Route("/v2/upload/{token}", self.transfer, methods=["GET", "PUT"]))
         app.routes.append(Route("/v2/download/{token}", self.download, methods=["GET"]))
 
@@ -119,6 +126,8 @@ class Production:
         }
         folder = self.store.job_dir(row["project"], row["id"]) / "artifacts"
         progress = folder / "progress.json"
+        if row["status"] == "running" and self.relay:
+            progress = folder.parent / "remote-progress.json"
         try:
             counts = json.loads(progress.read_text()) if progress.is_file() else None
         except (OSError, ValueError):
@@ -141,6 +150,11 @@ class Production:
                     data["worker_resources"][name] = (Path("/sys/fs/cgroup") / path).read_text().strip()
                 except OSError:
                     data["worker_resources"][name] = None
+            if self.relay:
+                try:
+                    data["worker_resources"] = json.loads((folder / "worker-metrics.json").read_text())
+                except (OSError, ValueError):
+                    data["worker_resources"] = None
         data["frames_done"] = counts["done"] if counts else 0
         data["frames_total"] = len(spec.get("frames", []))
         if (folder / "execution.log").is_file() and row["status"] not in {"running", "queued"}:
@@ -394,6 +408,8 @@ class Production:
         def task_status(project_id: UUID, task_id: UUID) -> dict[str, Any]:
             """Query persisted status, errors, logs, frames completed and the output index."""
             p = store.require_project(project_id.hex)["id"]
+            if self.relay:
+                self.relay.reap()
             return self.task_data(store.task(p, task_id.hex))
 
         @mcp.tool(annotations=write)

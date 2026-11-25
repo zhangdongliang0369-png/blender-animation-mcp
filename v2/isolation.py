@@ -23,6 +23,7 @@ class Sandbox:
         self.script = Path(__file__).with_name("worker.py").resolve()
         self.memory_mib = int(os.environ.get("BLENDER_V2_MEMORY_MIB", "1024"))
         self.disk_mib = int(os.environ.get("BLENDER_V2_JOB_DISK_MIB", "192"))
+        self.peak_rss = 0
 
     def command(self, job: Path, args: list[str], seconds: int) -> list[str]:
         blender = str(self.blender)
@@ -83,7 +84,9 @@ class Sandbox:
                 )
                 if allocated > self.disk_mib * MIB:
                     raise WorkerError("DISK_LIMIT", "Task exceeded its artifact disk limit")
-                if process_group_rss(proc.pid) > self.memory_mib * MIB:
+                current_rss = process_group_rss(proc.pid)
+                self.peak_rss = max(self.peak_rss, current_rss)
+                if current_rss > self.memory_mib * MIB:
                     raise WorkerError("MEMORY_LIMIT", "Task exceeded its memory limit")
             if wait.result() != 0:
                 log.flush()
