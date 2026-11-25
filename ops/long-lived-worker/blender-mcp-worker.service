@@ -1,0 +1,26 @@
+[Unit]
+Description=Blender MCP outbound execution worker
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=blenderworker
+Group=blenderworker
+WorkingDirectory=/opt/blender-mcp/source
+EnvironmentFile=/etc/blender-mcp/worker.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+StateDirectory=blender-mcp-worker
+StateDirectoryMode=0700
+ExecStart=/opt/blender-mcp/venv/bin/python -m v2.remote_worker
+Restart=on-failure
+RestartSec=10s
+NoNewPrivileges=yes
+UMask=0077
+LimitCORE=0
+MemoryMax=7G
+TasksMax=256
+
+[Install]
+WantedBy=multi-user.target
