@@ -14,7 +14,13 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, Response
 from starlette.routing import Route
 
-origin = (os.environ.get("BLENDER_PUBLIC_URL") or os.environ["RENDER_EXTERNAL_URL"]).rstrip("/")
+railway_domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN")
+origin = (
+    os.environ.get("BLENDER_PUBLIC_URL")
+    or os.environ.get("RENDER_EXTERNAL_URL")
+    or (f"https://{railway_domain}" if railway_domain else None)
+    or f"http://127.0.0.1:{os.environ.get('PORT', '10000')}"
+).rstrip("/")
 access_id = os.environ["BLENDER_ACCESS_ID"]
 work = Path(os.environ.get("BLENDER_RENDER_DIR", "./renders")).resolve()
 work.mkdir(mode=0o700, parents=True, exist_ok=True)
