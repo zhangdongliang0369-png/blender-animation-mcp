@@ -1,0 +1,1 @@
+# blender-animation-mcp
