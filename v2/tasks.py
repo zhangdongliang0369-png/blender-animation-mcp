@@ -149,6 +149,10 @@ class TaskRunner:
                             "-c:v", "libx264", "-threads", "1", "-pix_fmt", "yuv420p",
                             "-movflags", "+faststart", "/output/preview.mp4",
                         ], remaining(), log, cancelled)
+                        await self.sandbox.run(folder, [
+                            "/usr/bin/ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                            "stream=codec_name,width,height,nb_frames", "-of", "json", "/output/preview.mp4",
+                        ], remaining(), log, cancelled)
                 remaining()
             required = {
                 "import": ["scene.blend", "model-report.json"],
@@ -165,6 +169,16 @@ class TaskRunner:
                 path = out / name
                 if path.is_symlink() or not path.is_file() or not path.stat().st_size:
                     raise WorkerError("MISSING_OUTPUT", f"Expected output is missing: {name}")
+                with path.open("rb") as stream:
+                    signature = stream.read(12)
+                suffix = path.suffix
+                if (
+                    (suffix == ".png" and not signature.startswith(b"\x89PNG\r\n\x1a\n"))
+                    or (suffix == ".mp4" and signature[4:8] != b"ftyp")
+                    or (suffix == ".blend" and not signature.startswith((b"BLENDER", b"\x28\xb5\x2f\xfd")))
+                    or (suffix == ".zip" and not signature.startswith(b"PK"))
+                ):
+                    raise WorkerError("INVALID_OUTPUT", f"Unexpected file signature: {name}")
             outputs = [{
                 "name": p.name, "bytes": p.stat().st_size, "sha256": sha256(p),
             } for p in sorted(out.iterdir()) if p.is_file() and not p.is_symlink() and p.name != "progress.json"]

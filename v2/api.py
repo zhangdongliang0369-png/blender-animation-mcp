@@ -124,8 +124,23 @@ class Production:
         except (OSError, ValueError):
             counts = None
         env = folder / "environment.json"
-        actual = json.loads(env.read_text()) if row["status"] in {"completed", "failed"} and env.is_file() else {}
+        try:
+            actual = json.loads(env.read_text()) if row["status"] in {"completed", "failed"} and env.is_file() else {}
+        except (OSError, ValueError):
+            actual = {}
         data["actual_blender_version"] = actual.get("blender")
+        if spec["operation"] == "probe":
+            data["runtime"] = actual or None
+            data["worker_resources"] = {
+                "visible_cpu_count": len(os.sched_getaffinity(0)),
+                "configured_job_memory_mib": self.tasks.sandbox.memory_mib,
+                "configured_job_disk_mib": self.tasks.sandbox.disk_mib,
+            }
+            for name, path in (("cpu_quota", "cpu.max"), ("memory_limit_bytes", "memory.max")):
+                try:
+                    data["worker_resources"][name] = (Path("/sys/fs/cgroup") / path).read_text().strip()
+                except OSError:
+                    data["worker_resources"][name] = None
         data["frames_done"] = counts["done"] if counts else 0
         data["frames_total"] = len(spec.get("frames", []))
         if (folder / "execution.log").is_file() and row["status"] not in {"running", "queued"}:
@@ -266,7 +281,7 @@ class Production:
         def blender_info(project_id: UUID, request_id: UUID, test_engine: Engine | None = None) -> dict[str, Any]:
             """Run Blender to measure its actual version; optionally smoke-render a specific engine on CPU."""
             config = RenderSettings(engine=test_engine, width=128, height=128, samples=4).model_dump() if test_engine else None
-            return self.submit(project_id.hex, str(request_id), "probe", render=config)
+            return self.submit(project_id.hex, str(request_id), "probe", render=config, frames=[1] if test_engine else [])
 
         @mcp.tool(annotations=write)
         def import_model(project_id: UUID, asset_id: UUID, request_id: UUID, dependency_asset_ids: list[UUID] | None = None) -> dict[str, Any]:
