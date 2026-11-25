@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import hmac
 import logging
 import os
 import time
@@ -28,7 +30,11 @@ active_render: asyncio.Task[None] | None = None
 logger = logging.getLogger(__name__)
 mcp = FastMCP(
     "Blender 云端预演",
-    instructions="提交基础图形动画预演。render_preview 返回任务编号。用 preview_status 查询结果；仍在渲染时把编号告诉用户，收到用户查询后再查看。仅发送图形和颜色。",
+    instructions=(
+        "基础图形使用 render_preview 并以 preview_status 查询。"
+        "若已启用 V2 项目工具，先创建项目、用授权上传链接接收文件，随后导入、编辑、渲染及获取成果。"
+        "不要把大文件内容放进工具参数，也不要把用户资料上传至公开代码仓库。"
+    ),
     streamable_http_path=f"/{access_id}/mcp",
     stateless_http=True,
     json_response=True,
@@ -38,6 +44,12 @@ mcp = FastMCP(
         allowed_hosts=["127.0.0.1:*", origin.split("://", 1)[1]],
     ),
 )
+
+production = None
+if os.environ.get("BLENDER_V2_DIR"):
+    from v2.api import Production
+    production = Production(mcp, origin, access_id, lambda: active_render is not None and not active_render.done())
+
 
 class RenderJob(TypedDict):
     job_id: str
@@ -89,6 +101,8 @@ async def render_preview(
 ) -> RenderJob:
     """提交 2 秒的 Blender 基础图形动画。用返回的任务编号查询结果。"""
     global active_render
+    if production and production.store.one("SELECT 1 FROM jobs WHERE status IN ('queued','running') LIMIT 1", ()):
+        raise RuntimeError("Blender 正在处理生产任务，请稍后重试。")
     if active_render is not None and not active_render.done():
         raise RuntimeError("Blender 正在渲染，请稍后提交新任务。")
     for folder in work.iterdir():
@@ -101,6 +115,16 @@ async def render_preview(
     return {"job_id": job_id, "status": "rendering", "video_url": None, "blend_url": None}
 
 
+def preview_download(job_id, name):
+    url = f"{origin}/files/{job_id}/{name}"
+    if production is None:
+        return url
+    expires = int(time.time()) + 900
+    payload = f"preview:{job_id}:{name}:{expires}".encode()
+    tag = hmac.new(production.store.secret, payload, hashlib.sha256).hexdigest()
+    return f"{url}?expires={expires}&signature={tag}"
+
+
 @mcp.tool(annotations=ToolAnnotations(
     title="查看 Blender 渲染结果", readOnlyHint=True, openWorldHint=False,
 ))
@@ -110,11 +134,10 @@ async def preview_status(job_id: UUID) -> RenderJob:
     if not folder.is_dir() or time.time() - folder.stat().st_mtime > 3600:
         raise ValueError("找不到任务，或任务已经过期。")
     if (folder / "completed").is_file():
-        files_url = f"{origin}/files/{job_id}"
         return {
             "job_id": str(job_id), "status": "completed",
-            "video_url": f"{files_url}/preview.mp4",
-            "blend_url": f"{files_url}/scene.blend",
+            "video_url": preview_download(job_id, "preview.mp4"),
+            "blend_url": preview_download(job_id, "scene.blend"),
         }
     status = "failed" if (folder / "failed").is_file() else "rendering"
     return {"job_id": str(job_id), "status": status, "video_url": None, "blend_url": None}
@@ -124,7 +147,17 @@ async def download(request: Request):
     filename = request.path_params["filename"]
     if filename not in {"preview.mp4", "scene.blend"}:
         return Response(status_code=404)
-    folder = work / str(request.path_params["job_id"])
+    job_id = request.path_params["job_id"]
+    if production is not None:
+        expires = request.query_params.get("expires", "")
+        signature = request.query_params.get("signature", "")
+        if not expires.isdecimal() or len(expires) > 12 or int(expires) < time.time():
+            return Response(status_code=403)
+        message = f"preview:{job_id}:{filename}:{expires}".encode()
+        expected = hmac.new(production.store.secret, message, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            return Response(status_code=403)
+    folder = work / str(job_id)
     path = folder / filename
     if not (folder / "completed").is_file() or not path.is_file() or time.time() - folder.stat().st_mtime > 3600:
         return Response(status_code=404)
@@ -138,3 +171,6 @@ async def health(_request: Request):
 app = mcp.streamable_http_app()
 app.routes.append(Route("/health", health))
 app.routes.append(Route("/files/{job_id:uuid}/{filename}", download))
+
+if production:
+    production.mount(app)

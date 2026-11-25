@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.env
+renders/
+*.blend
+*.blend1
+*.mp4
+*.sqlite3*
