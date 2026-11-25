@@ -64,6 +64,10 @@ async def render(folder: Path, shape: str, color: str) -> None:
                     await process.wait()
                 raise
         if status or not (project.is_file() and (folder / "preview.mp4").is_file()):
+            with (folder / "render.log").open("rb") as log:
+                log.seek(max(0, (folder / "render.log").stat().st_size - 4096))
+                details = log.read().decode("utf-8", errors="replace").strip()
+            logger.error("Blender output on failure: %s", details)
             raise RuntimeError(f"Blender exited with status {status} or did not produce both files")
     except asyncio.CancelledError:
         (folder / "failed").touch()
